@@ -1,69 +1,70 @@
-// api.js — unchanged from Lesson 5
-import { OMDB_API_KEY, GROQ_API_KEY, GROQ_MODELS } from '../config';
+import { COVER_URL, GROQ_API_KEY, GROQ_MODEL, GROQ_URL, OPEN_LIBRARY_SEARCH, OPEN_LIBRARY_WORK } from "../config";
+import { normalizeBook } from "./helpers";
 
-// Safe ratings only — encoded as Base64. Anything not in this list is blocked.
-// G=Rw==  TV-G=VFYtRw==  TV-PG=VFYtUEc=  TV-14=VFYtMTQ=
-const _sr = ['Rw==','VFYtRw==','VFYtUEc=','VFYtMTQ='].map(atob);
-const _isSafe = r => !!r && _sr.some(s => r.toUpperCase() === s.toUpperCase());
-
-export async function omdbSearch(query) {
-  if (!OMDB_API_KEY) { console.warn('[OMDb] No API key'); return []; }
-  const original = query.trim();
-  const cleaned  = original.replace(/\.(?=[A-Za-z])/g, '').replace(/[:.]/g, ' ').replace(/\s+/g, ' ').trim();
-  const terms    = [...new Set([original, cleaned])];
-  const fetchTerm = term =>
-    fetch(`https://www.omdbapi.com/?apikey=${OMDB_API_KEY}&s=${encodeURIComponent(term)}&type=movie`)
-      .then(r => r.json()).then(d => d.Response === 'True' ? d.Search : []).catch(() => []);
-  const seen = new Set(), merged = [];
-  for (const arr of await Promise.all(terms.map(fetchTerm)))
-    for (const m of arr)
-      if (!seen.has(m.imdbID)) { seen.add(m.imdbID); merged.push(m); }
-  const withRatings = await Promise.all(
-    merged.map(m =>
-      fetch(`https://www.omdbapi.com/?apikey=${OMDB_API_KEY}&i=${m.imdbID}`)
-        .then(r => r.json()).then(d => {
-          console.log(`[OMDb] ${m.Title} (${m.imdbID}): Rated="${d.Rated}"`);
-          return { ...m, Rated: d.Rated || '' };
-        }).catch(() => m)
-    )
-  );
-  const filtered = withRatings.filter(m => _isSafe(m.Rated));
-  console.log(`[OMDb] Search "${query}": ${merged.length} total, ${filtered.length} after filter`);
-  return filtered;
+export async function requestJson(url, options) {
+  const response = await fetch(url, options);
+  if (!response.ok) throw new Error("Request failed.");
+  return response.json();
 }
 
-export async function omdbDetails(imdbID) {
-  if (!OMDB_API_KEY || !imdbID) return null;
-  try {
-    const d = await fetch(`https://www.omdbapi.com/?apikey=${OMDB_API_KEY}&i=${imdbID}&plot=full`).then(r => r.json());
-    if (d.Response !== 'True' || !_isSafe(d.Rated)) return null;
-    return d;
-  } catch { return null; }
-}
-
-export async function callGroq(messages, modelIndex = 0) {
-  if (!GROQ_API_KEY) { console.error('[Groq] No API key'); return { error: 'no_key' }; }
-  const model = GROQ_MODELS[modelIndex];
-  if (!model) return { error: 'all_models_failed' };
-  const controller = new AbortController();
-  const timeout    = setTimeout(() => controller.abort(), 25000);
-  try {
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, messages, max_tokens: 800, temperature: 0.75 }),
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-    if (res.status === 401 || res.status === 403) return { error: 'auth' };
-    if (res.status === 429 || !res.ok)
-      return modelIndex + 1 < GROQ_MODELS.length ? callGroq(messages, modelIndex + 1) : { error: res.status === 429 ? 'rate_limit' : 'server_error' };
-    const reply = (await res.json())?.choices?.[0]?.message?.content?.trim() || '';
-    if (!reply) return modelIndex + 1 < GROQ_MODELS.length ? callGroq(messages, modelIndex + 1) : { error: 'empty_reply' };
-    return { success: true, reply };
-  } catch (err) {
-    clearTimeout(timeout);
-    if (err.name === 'AbortError') return modelIndex + 1 < GROQ_MODELS.length ? callGroq(messages, modelIndex + 1) : { error: 'timeout' };
-    return { error: 'network_error' };
+export async function getAiRecommendations({ mood, genre, ageMode }) {
+  if (!GROQ_API_KEY || GROQ_API_KEY === "your_groq_api_key_here") {
+    throw new Error("Please add your Groq API key inside the .env file.");
   }
+
+  const messages = [
+    {
+      role: "system",
+      content:
+        "You are a helpful book recommendation assistant. Recommend exactly 5 books. Return each title in double quotes, each on a new line, followed by a very short reason. Keep suggestions age-appropriate."
+    },
+    {
+      role: "user",
+      content: `Mood: ${mood}. Genre: ${genre}. Age mode: ${ageMode}. Recommend books.`
+    }
+  ];
+
+  const data = await requestJson(GROQ_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      messages,
+      temperature: 0.7,
+      max_tokens: 350,
+    }),
+  });
+
+  return data.choices?.[0]?.message?.content?.trim() || "";
+}
+
+export async function searchBookByTitle(title) {
+  const data = await requestJson(`${OPEN_LIBRARY_SEARCH}?title=${encodeURIComponent(title)}&limit=1`);
+  return data.docs?.[0] ? normalizeBook(data.docs[0]) : null;
+}
+
+export async function searchBooksFromTitles(titles) {
+  const books = await Promise.all(titles.map(searchBookByTitle));
+  return books.filter(Boolean);
+}
+
+export async function getWorkDetails(workKey) {
+  const data = await requestJson(`${OPEN_LIBRARY_WORK}${workKey}.json`);
+  const description =
+    typeof data.description === "string"
+      ? data.description
+      : data.description?.value || "";
+
+  const subjects = data.subjects?.slice(0, 8) || [];
+  const covers = data.covers || [];
+
+  return {
+    description,
+    subjects,
+    coverLarge: covers[0] ? COVER_URL(covers[0], "L") : "",
+    title: data.title || "",
+  };
 }
